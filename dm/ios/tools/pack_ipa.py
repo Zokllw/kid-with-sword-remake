@@ -13,6 +13,9 @@
 #   unchanged; --no-reuse forces a full pack. The index holds only source metadata and compression settings; ZIP metadata comes from the old IPA.
 #   Only mappings whose source folder is on APFS reuse files; other mappings pack their files again. The kept run needs an APFS clone of the old IPA; if cloning fails, eligible files are copied compressed.
 #   Reused bytes are not checked against their CRC: damage inside the old IPA carries over. Use --no-reuse or delete <out.ipa>.idx to rebuild
+#   An NVN game's shader image over PART bytes goes in as parts <name>.img.0, .1, ... of PART bytes each but the last (read in place by the host: romfs_image.h romfs_image_open_parts).
+#   Ocarina of Time's 5.05 GB image was the one entry over 4 GiB, so the IPA needed ZIP64, and an on-device signer (FlareStore) could not sign it: with the image in parts
+#   no entry, size or offset needs ZIP64 while the archive stays under 4 GiB. A pack that still needs it says so in a [RED] line
 import argparse, atexit, collections, concurrent.futures as cf, ctypes, json, os, re, shutil, stat, struct, sys, tempfile, time, zipfile, zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', 'tools'))
@@ -26,17 +29,23 @@ QUEUE = 4096         # entries in the pool at once (folders of tiny files)
 CHUNK = 16 << 20
 L32, L16 = 0xFFFFFFFF, 0xFFFF
 DIR_MODE = stat.S_IFDIR | 0o755   # a parent folder no source folder stands for (Payload/, msl/); its time is 1980-01-01, so it is the same in every pack
-Entry = collections.namedtuple('Entry', 'name path st root')   # st None: a synthetic parent; root: the mapping's source folder
+PART = (2 << 30) - (1 << 20)   # a shader image's part (2047 MiB): under 2 GiB, for unzippers whose sizes are signed 32-bit
+Entry = collections.namedtuple('Entry', 'name path st root off', defaults=(None,))   # st None: a synthetic parent; root: the mapping's source folder; off: a part's offset in path
 
 
-def entries(maps, skip, skip_suffix=()):
+class PartStat:   # a part's stat: the file's, with the part's size
+    def __init__(self, st, size): self._st, self.st_size = st, size
+    def __getattr__(self, k): return getattr(self._st, k)
+
+
+def entries(maps, skip, skip_suffix=(), split=()):
     """The archive's entries in order: for each mapping its parent folders (unless an earlier entry gave them), its root, then its tree depth first, sorted by name,
     without the skipped paths and without other mappings' roots (each adds its own). Parents needed before their mapping are synthetic folders with fixed metadata."""
     roots, out, seen, parents = {a for a, _ in maps}, [], set(), set()
-    def add(name, path, st):
+    def add(name, path, st, off=None):
         if name in parents and st is not None and stat.S_ISDIR(st.st_mode): return   # written already, as a parent folder
         if name in seen: sys.exit(f'[RED] pack_ipa: {name} twice in the archive')
-        seen.add(name); out.append(Entry(name, path, st, src))
+        seen.add(name); out.append(Entry(name, path, st, src, off))
     def walk(d, arc):
         with os.scandir(d) as it: es = sorted(it, key=lambda e: e.name)
         for e in es:
@@ -53,7 +62,9 @@ def entries(maps, skip, skip_suffix=()):
             if p + '/' not in seen:
                 add(p + '/', None, None); parents.add(p + '/')
         source_stat = os.stat(src)
-        if stat.S_ISREG(source_stat.st_mode): add(arc, src, source_stat)
+        if stat.S_ISREG(source_stat.st_mode) and arc in split and source_stat.st_size > PART:   # in parts (see the top)
+            for i, off in enumerate(range(0, source_stat.st_size, PART)): add(f'{arc}.{i}', src, PartStat(source_stat, min(PART, source_stat.st_size - off)), off)
+        elif stat.S_ISREG(source_stat.st_mode): add(arc, src, source_stat)
         else: add(arc + '/', src, source_stat); walk(src, arc)
     return out
 
@@ -107,6 +118,7 @@ class Zip:
         if keep: self.f.seek(keep)
         self.pos, self.cd, self.written = keep, [], 0   # written: the bytes this pack writes (entries, header patches, the central directory; main adds the index)
         self.stats = collections.Counter()
+        self.z64 = []   # what needed ZIP64 fields: entry names, or the archive's end records
 
     def w(self, b):
         self.f.write(b); self.pos += len(b); self.written += len(b)
@@ -118,6 +130,7 @@ class Zip:
     def central(self, e, h, method, crc, csize, usize):
         off, nb, fl, t, d = h
         z = [v for v in (usize, csize, off) if v >= L32]   # zip64 extra: the fields that do not fit, in this order
+        if z: self.z64.append(e.name)
         ext = struct.pack(f'<HH{len(z)}Q', 1, 8 * len(z), *z) if z else b''
         mode = e.st.st_mode if e.st else DIR_MODE
         self.cd.append(struct.pack('<IHHHHHHIIIHHHHHII', 0x02014B50, 0x031E, 45 if z else 20 if method == 8 else 10, fl, method, t, d, crc, min(csize, L32), min(usize, L32),
@@ -146,7 +159,8 @@ class Zip:
         h = self.local(e, 8 if deflate else 0, 0, 0 if deflate else usize, usize, z64)
         crc, csize, read, c = 0, 0, 0, zlib.compressobj(LEVEL, zlib.DEFLATED, -15) if deflate else None
         with open(e.path, 'rb') as f:
-            while b := f.read(CHUNK):
+            if e.off is not None: f.seek(e.off)   # a part: its bytes of the file
+            while read < usize and (b := f.read(min(CHUNK, usize - read))):
                 read += len(b); crc = zlib.crc32(b, crc)
                 if c: b = c.compress(b)
                 self.w(b); csize += len(b)
@@ -174,7 +188,7 @@ class Zip:
     def close(self):   # the central directory and the end records (zip64 ones when the count, the size or the offset does not fit)
         self.cd_off, n = self.pos, len(self.cd); blob = b''.join(self.cd); self.w(blob)
         if n >= L16 or self.cd_off >= L32 or len(blob) >= L32:
-            z = self.pos
+            self.z64.append('the end records (over 4 GiB of archive or 65535 entries)'); z = self.pos
             self.w(struct.pack('<IQHHIIQQQQ', 0x06064B50, 44, 0x031E, 45, 0, 0, n, n, len(blob), self.cd_off))
             self.w(struct.pack('<IIQI', 0x07064B50, 0, z, 1))
         self.w(struct.pack('<IHHHHIIH', 0x06054B50, 0, 0, min(n, L16), min(n, L16), min(len(blob), L32), min(self.cd_off, L32), 0))
@@ -197,7 +211,7 @@ def load_index(out):   # (the old IPA opened, its index) when <out>.idx describe
 
 def fingerprint(e, deflate):
     st = e.st
-    return [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, deflate]
+    return [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, deflate] + ([e.off] if e.off is not None else [])
 
 
 def match(e, row, info, old, idx, apfs):   # one header comparison for both the kept run and later compressed copies
@@ -261,7 +275,8 @@ def main():
     store = tuple(s.lower() for s in a.store.split(':') if s)
     t0 = time.time()
     if len({arc for arc, _ in maps}) != len(maps): sys.exit('[RED] pack_ipa: mapping twice in the archive')
-    es = entries(maps, {s.strip('/') for s in a.skip}, tuple(a.skip_suffix))
+    split = {arc for arc, src in maps if re.fullmatch(r'.*/msl/(p\d+/)?b-[^/]+\.img', arc)}   # the shader images (library_map)
+    es = entries(maps, {s.strip('/') for s in a.skip}, tuple(a.skip_suffix), split)
     total = sum(e.st.st_size for e in es if e.st and stat.S_ISREG(e.st.st_mode))
     print(f'pack: {len(es)} entries, {total} bytes', flush=True)
     apfs = {root: fs_type(root) == b'apfs' for root in {src for _, src in maps}}
@@ -298,7 +313,7 @@ def main():
                 info = infos.get(e.name)
                 h = match(e, files[e.name], info, old, idx, apfs) if old else None
                 if h is not None: pend.append(('reuse', e, (info, h))); continue
-                if e.st.st_size > BIG:
+                if e.st.st_size > BIG or e.off is not None:   # (a part is read from its offset, by the writer)
                     while pend: inflight -= one()
                     z.stream(e, deflate); continue
                 while pend and (len(pend) >= QUEUE or inflight + e.st.st_size > WINDOW): inflight -= one()
@@ -320,6 +335,8 @@ def main():
         os.replace(ipart, a.out + '.idx'); z.written += len(blob)
     except OSError as x: print(f'[RED] pack_ipa: index not written, the next pack packs every file again: {x}', flush=True)
     s, dt = z.stats, time.time() - t0
+    if z.z64: print(f'[RED] pack_ipa: the IPA needs ZIP64 for {", ".join(z.z64[:5])}{" and more" if len(z.z64) > 5 else ""}: an on-device signer whose unzipper has no ZIP64 cannot sign it', flush=True)
+    else: print('pack: no ZIP64 needed (every entry, size and offset fits the 32-bit fields)', flush=True)
     print(f'packed: {len(es)} entries, stored {s["stored"] / 2**30:.2f} GB, deflated {s["deflated"] / 2**30:.2f} GB, archive {st.st_size / 2**30:.2f} GB, '
           f'kept {kept / 2**30:.2f} GB, reused {s["reused"]} files in {dt:.0f} s, wrote {z.written / 2**30:.2f} GB' + (f'; {disabled}' if disabled else ''), flush=True)
 

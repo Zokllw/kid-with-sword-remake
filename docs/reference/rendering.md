@@ -1354,6 +1354,15 @@ The Vulkan layer (`dm/gfx/vk/hle_vk.m`) was written for Hades; Super Mario Galax
 - **Fix:** `hle_vk.m` keeps the set of descriptor sets that exist, and a free of one that is gone is ignored; a swap chain's image is marked, and `vkDestroyImage` of it is ignored (the swap chain owns it).
 - **Found on:** [Super Mario 64 (Super Mario 3D All-Stars)](../../dm/games/010049900F546001/README.md), on the way back to the launcher.
 
+### Occlusion conditions decided by the frame before's result (experimental)
+
+- **Symptom:** a game's conditional draws are drawn though most of them would be skipped: Ocarina of Time on an iPhone had 94 % of its conditions unknown at encode time (log 80: 137,221 of 145,517), and of those decided about half were hidden.
+- **Cause:** the game reports a samples-passed query a submission ahead of the draws it conditions, and the result is written only when that submission completes on the GPU, after the host has encoded the draws. Metal has no predication to decide them on the GPU in time.
+- **Option:** `DM_NVN_RC_STALE=1` (launcher: Skip hidden objects, experimental, off by default): a condition whose result has not landed takes the result that landed before it at the same address, the same query a frame earlier (`rc_value` returns 2; the conditional rendering line counts those apart). An object coming into view is drawn a frame late; a query that never landed, and other counter kinds, still draw.
+- **Not done:** the exact way, conditional draws turned into indirect draws whose count the GPU writes from the query.
+- **Check:** `make -C dm/gfx/tests GAME=0400486024DEC000 check_t_sbw`.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (log 80). Not judged in play.
+
 ### Occlusion queries that span render encoders
 
 - **Symptom:** `[RED] occlusion query outside a render pass or past the buffer`; a query's result stays 0.

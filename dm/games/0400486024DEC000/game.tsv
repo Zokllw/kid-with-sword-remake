@@ -61,6 +61,10 @@ pool_skip_retired	on
 # but a texture the game makes again over released pages reads zeros: magenta and black ground, cliffs, walls and doors after area changes (Kokiri Forest, Hyrule Field, Hyrule Castle).
 # Upstream #1641 and #1972 (both on this fork) found level 1 fixes it. DM_TEX_RELEASE=2 brings the saving back
 tex_release	1
+# X10, from nxnative main's profile: the terrain's height, blend and hole maps are written by the CPU into textures after they are made, which without these keys stay
+# zero. A member's X9 on an iPhone 18 Pro at Death Mountain Trail: blocks of the rock and ground missing (the sky through them), others stretched or the wrong material
+tex_flush_upload	on
+tex_dirty_upload	on
 # Large block-compressed textures from the game files kept without their finest level on the GPU (tex_soft, ported from the plumber-racer-2 fork)
 tex_soft	on
 # rt_drop (render targets taken over by a later-drawn one become 1x1 stand-ins, nvn_mtl.m rtd_sweep) is off: footprint 8.9 → 7.1 GB at the Kokiri Forest doorway, but the game still

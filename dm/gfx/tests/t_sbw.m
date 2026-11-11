@@ -76,6 +76,16 @@ int main(void){@autoreleasepool{
     CHECK("a landing with none pending changes nothing",rc_value((uint64_t)&q[0],&x)&&x==5);
     q[2]=7;rc_note((uint64_t)&q[2],3);rc_landed((uint64_t)&q[2]);
     CHECK("another counter kind stays unknown",!rc_value((uint64_t)&q[2],&x));
+    // DM_NVN_RC_STALE: a pending query that has landed before takes that result; one that never landed, and another counter kind, stay unknown
+    g_rc_stale=1;rc_note((uint64_t)&q[0],2);
+    CHECK("stale: a pending query takes the result that landed before",rc_value((uint64_t)&q[0],&x)==2&&x==5);
+    CHECK("stale: a query that never landed stays unknown",!rc_value(0x7100000000ull,&x));
+    CHECK("stale: another counter kind stays unknown",!rc_value((uint64_t)&q[2],&x));
+    rc_landed((uint64_t)&q[0]);
+    CHECK("stale: landed again, it is known as before",rc_value((uint64_t)&q[0],&x)==1&&x==5);
+    g_rc_stale=0;rc_note((uint64_t)&q[0],2);
+    CHECK("stale off: a pending query is unknown",!rc_value((uint64_t)&q[0],&x));
+    rc_landed((uint64_t)&q[0]);
     for(uint64_t i=0;i<300;i++)rc_note((uint64_t)&big+0x1000+i,1);
     CHECK("more timestamp reports than the first table held",rc_value((uint64_t)&big+0x1000,&x)&&x==0);
     g_rc_npend=0;}

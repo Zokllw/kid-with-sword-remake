@@ -21,10 +21,27 @@ static const img_ent *msl_image_find(const romfs_img *m, const char *name) {
 // The file's bytes mapped read only: data and size are the file's, base and base_len what munmap takes. 0 on failure, with errno set (an empty file maps nothing: EINVAL)
 // MAP_SHARED: nothing writes through a read-only mapping, an image never changes in place (shader_lib.py publishes a new one by rename), and on a file this size a private mapping costs about 80 µs against 0.9 µs (Skyward Sword HD's 127 MB image)
 typedef struct { const void *data; size_t size; void *base; size_t base_len; } msl_map;
+// An image in parts (romfs_image_open_parts: the IPA's shader image, pack_ipa.py): the file is mapped from the part that holds it, at its offset there (a part's size is a multiple of the
+// page size); one that straddles two parts is read into anonymous memory, so munmap releases either. Mapping part 0's descriptor at the image's offset read past that part's end: SIGBUS in
+// lib_from_file's memmem at the first shader stored in part 1 (X10 / Z1 on the iPhone, 7.6 s in)
 static int msl_image_map(const romfs_img *m, const img_ent *x, msl_map *out) {
     if (!x->b) { errno = EINVAL; return 0; }
-    uint64_t delta = x->a % (uint64_t)getpagesize();
-    void *p = mmap(NULL, (size_t)(x->b + delta), PROT_READ, MAP_SHARED, m->fd, (off_t)(x->a - delta));
+    int fd = m->fd; uint64_t at = x->a;
+    if (m->nparts) {
+        uint64_t i = x->a / m->psize; at = x->a % m->psize;
+        if (i >= (uint64_t)m->nparts) { errno = EINVAL; return 0; }
+        if (i + 1 < (uint64_t)m->nparts && at + x->b > m->psize) {   // across a part boundary
+            void *p = mmap(NULL, (size_t)x->b, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (p == MAP_FAILED) return 0;
+            if (!romfs_image_pread(m, p, (size_t)x->b, (off_t)x->a)) { int e = errno; munmap(p, (size_t)x->b); errno = e; return 0; }
+            mprotect(p, (size_t)x->b, PROT_READ);
+            out->base = p; out->base_len = (size_t)x->b; out->data = p; out->size = (size_t)x->b;
+            return 1;
+        }
+        fd = m->pfd[i];
+    }
+    uint64_t delta = at % (uint64_t)getpagesize();
+    void *p = mmap(NULL, (size_t)(x->b + delta), PROT_READ, MAP_SHARED, fd, (off_t)(at - delta));
     if (p == MAP_FAILED) return 0;
     out->base = p; out->base_len = (size_t)(x->b + delta); out->data = (const char *)p + delta; out->size = (size_t)x->b;
     return 1;
