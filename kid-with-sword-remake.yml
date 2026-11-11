@@ -1,0 +1,122 @@
+name: kid-with-sword-remake
+
+# Кладётся в форк репозитория как .github/workflows/kid-with-sword-remake.yml
+# Запускается вручную: вкладка Actions -> kid-with-sword-remake -> Run workflow
+# Дамп игры в репозиторий НЕ попадает: он скачивается по ссылке из секрета DUMP_URL.
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'Версия обновления игры (v131072 — требуемое обновление из релизов)'
+        required: false
+        default: 'v131072'
+      romfs:
+        description: 'Режим romfs: separate — нужен для крупных игр на iPhone'
+        required: false
+        default: 'separate'
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 350
+    env:
+      # Из заметок к релизам репозитория
+      DM_UPSCALER: metalfx
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: 'latest'
+
+      - name: Disk space before build
+        run: df -h /
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen zstd glslang
+          brew install --cask dotnet-sdk
+          brew cleanup -s || true
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'" gdown
+
+      - name: Download Metal toolchain
+        continue-on-error: true
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Download game dump (Google Drive)
+        run: |
+          set -euo pipefail
+          URL="${{ secrets.DUMP_URL }}"
+          if [ -z "$URL" ]; then
+            echo "::error::Секрет DUMP_URL не задан. Settings -> Secrets and variables -> Actions -> New repository secret."
+            exit 1
+          fi
+          mkdir -p ~/Games
+          gdown --fuzzy "$URL" -O ~/dump.download
+          ls -lh ~/dump.download
+          TYPE=$(file -b ~/dump.download)
+          echo "Скачан файл типа: $TYPE"
+          case "$TYPE" in
+            Zip*)
+              mkdir -p ~/Games/kid-with-sword-remake
+              unzip -q ~/dump.download -d ~/Games/kid-with-sword-remake
+              find ~/Games/kid-with-sword-remake -maxdepth 3 | head -50
+              ;;
+            *)
+              mv ~/dump.download ~/Games/kid-with-sword-remake.nup
+              ;;
+          esac
+          rm -f ~/dump.download
+          df -h /
+
+      - name: Build IPA
+        run: |
+          set -euo pipefail
+          if [ -d ~/Games/kid-with-sword-remake ]; then
+            python3 scripts/build_ipa_from_nsp.py ~/Games/kid-with-sword-remake \
+              --romfs "${{ inputs.romfs }}" \
+              --package "${{ inputs.package }}"
+          else
+            python3 scripts/build_ipa_from_nsp.py ~/Games/kid-with-sword-remake.nup \
+              --romfs "${{ inputs.romfs }}" \
+              --package "${{ inputs.package }}"
+          fi
+
+      - name: Collect and split outputs
+        run: |
+          set -euo pipefail
+          mkdir -p ~/out
+          find ~/Games -name '*.ipa' -exec cp {} ~/out/ \;
+          find ~/Games -name '*.img' -exec cp {} ~/out/ \;
+          ls -lh ~/out
+          cd ~/out
+          for f in *.img; do
+            [ -e "$f" ] || continue
+            split -b 8G "$f" "$f.part-"
+            rm "$f"
+          done
+          ls -lh ~/out
+          df -h /
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: kid-with-sword-remake-ipa
+          path: ~/out/*.ipa
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Upload RomFS parts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kid-with-sword-remake-romfs-parts
+          path: ~/out/*.part-*
+          compression-level: 0
+          if-no-files-found: warn
