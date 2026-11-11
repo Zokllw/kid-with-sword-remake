@@ -24,14 +24,16 @@ jobs:
       DM_UPSCALER: metalfx
       # Разрешает установку pip-пакетов в системное окружение macOS/Homebrew
       PIP_BREAK_SYSTEM_PACKAGES: 1
+      # Разрешает сборку с текущей версией компилятора Metal на раннере
+      ALLOW_OTHER_METAL: 'True'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select latest stable Xcode
+      - name: Select latest Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: 'latest-stable'
+          xcode-version: 'latest'
 
       - name: Disk space before build
         run: df -h /
@@ -46,29 +48,11 @@ jobs:
         run: |
           python3 -m pip install --break-system-packages --ignore-installed lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'" gdown
 
-      - name: Download Metal toolchain and align compiler check
+      - name: Download Metal toolchain
+        continue-on-error: true
         run: |
           sudo xcodebuild -license accept || true
-          xcodebuild -downloadComponent MetalToolchain || true
-          echo "Текущая версия Metal:"
-          xcrun -sdk iphoneos metal -v || true
-          # Находим строку с проверкой версии компилятора Metal в скриптах и отключаем жесткий выход по несовпадению минорной сборки
-          python3 -c '
-          import glob, re
-          for path in glob.glob("scripts/**/*.py", recursive=True) + glob.glob("*.py"):
-              with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                  content = f.read()
-              if "this Mac\x27s Metal compiler is not the one" in content:
-                  print(f"Патчим проверку Metal компилятора в {path}...")
-                  # Заменяем выброс ошибки/выход после этого сообщения на предупреждение
-                  patched = re.sub(
-                      r"(.*this Mac\x27s Metal compiler is not the one[^\n]*\n)(\s*)(sys\.exit\([^)]*\)|raise [^\n]+|exit\([^)]*\)|return\b[^\n]*)",
-                      r"\1\2pass",
-                      content
-                  )
-                  with open(path, "w", encoding="utf-8") as f:
-                      f.write(patched)
-          '
+          xcodebuild -downloadComponent MetalToolchain
 
       - name: Download game dump (Google Drive)
         env:
@@ -80,22 +64,39 @@ jobs:
             exit 1
           fi
           mkdir -p ~/Games
-          python3 -c '
-          import os, re, gdown
+          
+          FILE_ID=$(python3 -c '
+          import os, re
           url = os.environ["DUMP_URL"].strip()
-          out = os.path.expanduser("~/dump.download")
-          try:
-              gdown.download(url=url, output=out, fuzzy=True)
-          except TypeError:
-              m = re.search(r"(?:id=|/d/)([a-zA-Z0-9_-]{20,})", url)
-              if m:
-                  gdown.download(id=m.group(1), output=out)
-              else:
-                  gdown.download(url, out)
-          '
+          m = re.search(r"(?:id=|/d/)([a-zA-Z0-9_-]{20,})", url)
+          print(m.group(1) if m else "")
+          ')
+
+          if [ -n "$FILE_ID" ]; then
+            echo "Найден Google Drive ID: $FILE_ID. Скачиваем через usercontent..."
+            curl -c /tmp/gcookie -s -L "https://drive.google.com/uc?export=download&id=${FILE_ID}" > /tmp/gpage.html
+            UUID=$(python3 -c '
+            import re
+            html = open("/tmp/gpage.html", errors="ignore").read()
+            m = re.search(r"name=\"uuid\"\s+value=\"([^\"]+)\"", html)
+            print(m.group(1) if m else "")
+            ')
+            curl -Lb /tmp/gcookie "https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=t&uuid=${UUID}" -o ~/dump.download
+          else
+            echo "Обычная прямая ссылка, скачиваем через curl..."
+            curl -L "$DUMP_URL" -o ~/dump.download
+          fi
+
           ls -lh ~/dump.download
           TYPE=$(file -b ~/dump.download)
           echo "Скачан файл типа: $TYPE"
+
+          if echo "$TYPE" | grep -qi "HTML"; then
+            echo "::error::Вместо дампа скачалась HTML-страница (Google Drive заблокировал файл по квоте). Сделайте копию файла на Google Диске и обновите ссылку в секрете DUMP_URL!"
+            head -n 30 ~/dump.download
+            exit 1
+          fi
+
           case "$TYPE" in
             Zip*)
               mkdir -p ~/Games/kid-with-sword-remake
@@ -115,11 +116,13 @@ jobs:
           if [ -d ~/Games/kid-with-sword-remake ]; then
             python3 scripts/build_ipa_from_nsp.py ~/Games/kid-with-sword-remake \
               --romfs "${{ inputs.romfs }}" \
-              --package "${{ inputs.package }}"
+              --package "${{ inputs.package }}" \
+              --allow-other-metal
           else
             python3 scripts/build_ipa_from_nsp.py ~/Games/kid-with-sword-remake.nup \
               --romfs "${{ inputs.romfs }}" \
-              --package "${{ inputs.package }}"
+              --package "${{ inputs.package }}" \
+              --allow-other-metal
           fi
 
       - name: Collect and split outputs
