@@ -1,6 +1,5 @@
 name: kid-with-sword-remake
 
-# Кладётся в форк репозитория как .github/workflows/kid-with-sword-remake.yml
 # Запускается вручную: вкладка Actions -> kid-with-sword-remake -> Run workflow
 # Дамп игры в репозиторий НЕ попадает: он скачивается по ссылке из секрета DUMP_URL.
 
