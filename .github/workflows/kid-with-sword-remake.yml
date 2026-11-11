@@ -51,15 +51,28 @@ jobs:
         run: xcodebuild -downloadComponent MetalToolchain
 
       - name: Download game dump (Google Drive)
+        env:
+          DUMP_URL: ${{ secrets.DUMP_URL }}
         run: |
           set -euo pipefail
-          URL="${{ secrets.DUMP_URL }}"
-          if [ -z "$URL" ]; then
+          if [ -z "$DUMP_URL" ]; then
             echo "::error::Секрет DUMP_URL не задан. Settings -> Secrets and variables -> Actions -> New repository secret."
             exit 1
           fi
           mkdir -p ~/Games
-          gdown --fuzzy "$URL" -O ~/dump.download
+          python3 -c '
+          import os, re, gdown
+          url = os.environ["DUMP_URL"].strip()
+          out = os.path.expanduser("~/dump.download")
+          try:
+              gdown.download(url=url, output=out, fuzzy=True)
+          except TypeError:
+              m = re.search(r"(?:id=|/d/)([a-zA-Z0-9_-]{20,})", url)
+              if m:
+                  gdown.download(id=m.group(1), output=out)
+              else:
+                  gdown.download(url, out)
+          '
           ls -lh ~/dump.download
           TYPE=$(file -b ~/dump.download)
           echo "Скачан файл типа: $TYPE"
