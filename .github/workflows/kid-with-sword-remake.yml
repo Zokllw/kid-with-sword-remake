@@ -22,6 +22,8 @@ jobs:
     env:
       # Из заметок к релизам репозитория
       DM_UPSCALER: metalfx
+      # Разрешает установку pip-пакетов в системное окружение macOS/Homebrew
+      PIP_BREAK_SYSTEM_PACKAGES: 1
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,8 +44,8 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'" gdown
+          python3 -m pip install --upgrade pip --break-system-packages
+          python3 -m pip install --break-system-packages lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'" gdown
 
       - name: Download Metal toolchain
         continue-on-error: true
